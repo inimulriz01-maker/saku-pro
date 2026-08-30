@@ -1,19 +1,14 @@
 {
   "name": "saku-pro",
   "short_name": "saku-pro",
-  "start_url": ".",
+  "start_url": "/",
   "display": "standalone",
   "background_color": "#ffffff",
   "theme_color": "#ffffff",
   "icons": [
     {
-      "src": "sakupro.png",
-      "sizes": "192x192",
-      "type": "image/png"
-    },
-    {
-      "src": "sakupro.png",
-      "sizes": "512x512",
+      "src": "/sakupro.png",
+      "sizes": "520x520",
       "type": "image/png"
     }
   ]
