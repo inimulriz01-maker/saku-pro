@@ -35,9 +35,13 @@ export default function App() {
   const [showTransferForm, setShowTransferForm] = useState(false)
   const [editingId, setEditingId] = useState(null)
   const [searchTerm, setSearchTerm] = useState('')
-  const [periodText, setPeriodText] = useState('15 Agustus – 15 September 2026')
+  const [periodText, setPeriodText] = useState('Bulan Ini')
   const [notification, setNotification] = useState({ message: '', type: '' })
   const [isScanningReceipt, setIsScanningReceipt] = useState(false)
+
+  // Ref untuk menghindari race condition & kelola session stale
+  const settingsRequestIdRef = useRef(0)
+  const lastUserIdRef = useRef(null)
 
   // State Filter & Urutkan Pengeluaran
   const [expenseCategoryFilter, setExpenseCategoryFilter] = useState('')
@@ -85,27 +89,44 @@ export default function App() {
   }
 
   useEffect(() => {
+    let isMounted = true
+
     supabase.auth.getSession().then(({ data: { session } }) => {
+      if (!isMounted) return
       setSession(session)
       if (session) {
-        fetchData(true)
-        fetchSettings()
+        const uid = session.user.id
+        lastUserIdRef.current = uid
+        setPeriodText('Bulan Ini')
+        fetchData(true, uid)
+        fetchSettings(uid)
       } else {
+        lastUserIdRef.current = null
         setLoading(false)
+        setPeriodText('Bulan Ini')
       }
     })
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!isMounted) return
       setSession(session)
       if (session) {
-        fetchData(false)
-        fetchSettings()
+        const uid = session.user.id
+        lastUserIdRef.current = uid
+        setPeriodText('Bulan Ini')
+        fetchData(false, uid)
+        fetchSettings(uid)
       } else {
+        lastUserIdRef.current = null
         setLoading(false)
+        setPeriodText('Bulan Ini')
       }
     })
 
-    return () => subscription.unsubscribe()
+    return () => {
+      isMounted = false
+      subscription.unsubscribe()
+    }
   }, [])
 
   useEffect(() => {
@@ -173,24 +194,53 @@ export default function App() {
     await supabase.auth.signOut()
   }
 
-  async function fetchSettings() {
+  async function fetchSettings(currentUserId) {
+    const userId = currentUserId || session?.user?.id
+    if (!userId) {
+      setPeriodText('Bulan Ini')
+      return
+    }
+
+    const requestId = ++settingsRequestIdRef.current
+
     try {
-      const { data: res } = await supabase.from('app_settings').select('*').eq('key', 'period').single()
-      if (res && res.value) {
-        setPeriodText(res.value)
-      }
-    } catch {
-      const localPeriod = localStorage.getItem('sakupro_period')
-      if (localPeriod) setPeriodText(localPeriod)
+      const { data: res, error } = await supabase
+        .from('app_settings')
+        .select('value')
+        .eq('key', 'period')
+        .eq('user_id', userId)
+        .maybeSingle()
+
+      if (!lastUserIdRef.current || lastUserIdRef.current !== userId) return
+      if (requestId !== settingsRequestIdRef.current) return
+
+      if (error) throw error
+
+      const nextValue = res?.value
+      setPeriodText(nextValue || 'Bulan Ini')
+    } catch (e) {
+      if (!lastUserIdRef.current || lastUserIdRef.current !== userId) return
+      if (requestId !== settingsRequestIdRef.current) return
+
+      console.error('fetchSettings error:', e.message)
+      const localKey = `sakupro_period_${userId}`
+      const localPeriod = localStorage.getItem(localKey) || localStorage.getItem('sakupro_period')
+      setPeriodText(localPeriod || 'Bulan Ini')
     }
   }
 
   async function handleSavePeriod(newPeriod) {
     document.activeElement?.blur()
     setPeriodText(newPeriod)
-    localStorage.setItem('sakupro_period', newPeriod)
+    
+    const userId = session?.user?.id
+    if (!userId) return
+
+    localStorage.setItem(`sakupro_period_${userId}`, newPeriod)
+    localStorage.setItem('sakupro_period', newPeriod) // fallback legacy
+
     try {
-      await supabase.from('app_settings').upsert({ key: 'period', value: newPeriod }, { onConflict: 'key' })
+      await supabase.from('app_settings').upsert({ key: 'period', value: newPeriod, user_id: userId }, { onConflict: 'key, user_id' })
     } catch {
       // Fallback handled via localStorage
     }
@@ -244,12 +294,23 @@ export default function App() {
     }, 1500)
   }
 
-  async function fetchData(isInitial = false) {
+  async function fetchData(isInitial = false, currentUserId = null) {
     if (isInitial) setLoading(true)
+
+    const userId = currentUserId || session?.user?.id;
+    if (!userId) {
+      setLoading(false);
+      // Reset all data states when logged out to avoid data leakage
+      setData({ expenses: [], budgets: [], income: [], debts: [], investments: [], savings: [], wallets: [], assets: [] })
+      return;
+    }
 
     const fetchTable = async (table, localKey) => {
       try {
-        const { data: cloudData, error } = await supabase.from(table).select('*')
+        const { data: cloudData, error } = await supabase
+          .from(table)
+          .select('*')
+          .eq('user_id', userId)
         if (error) throw error
         if (cloudData) {
           localStorage.setItem(localKey, JSON.stringify(cloudData))
@@ -559,6 +620,12 @@ export default function App() {
       return
     }
 
+    const userId = session?.user?.id
+    if (!userId) {
+      showMessage('Sesi berakhir, silakan login kembali', 'error')
+      return
+    }
+
     let table = ''
     let payload = {}
 
@@ -581,29 +648,30 @@ export default function App() {
         actual: cleanAmount, 
         date: formInput.date, 
         notes: walletTag + categoryTag + formInput.notes, 
-        day_name: dayName 
+        day_name: dayName,
+        user_id: userId
       }
     } else if (activeTab === 'dompet') {
       table = 'wallets'
-      payload = { wallet_name: formInput.name, initial_balance: cleanAmount, wallet_type: formInput.status || 'Bank' }
+      payload = { wallet_name: formInput.name, initial_balance: cleanAmount, wallet_type: formInput.status || 'Bank', user_id: userId }
     } else if (activeTab === 'pemasukan') {
       table = 'income_sources'
-      payload = { source_name: formInput.name, min_amount: cleanAmount, max_amount: cleanMaxAmount || cleanAmount, status: formInput.status || 'Cair' }
+      payload = { source_name: formInput.name, min_amount: cleanAmount, max_amount: cleanMaxAmount || cleanAmount, status: formInput.status || 'Cair', user_id: userId }
     } else if (activeTab === 'hutang') {
       table = 'debts'
-      payload = { creditor_name: formInput.name, amount: cleanAmount, status: formInput.status || 'Belum Lunas', due_date: formInput.dueDate }
+      payload = { creditor_name: formInput.name, amount: cleanAmount, status: formInput.status || 'Belum Lunas', due_date: formInput.dueDate, user_id: userId }
     } else if (activeTab === 'investasi') {
       table = 'investments'
-      payload = { item_name: formInput.name, nominal: cleanAmount }
+      payload = { item_name: formInput.name, nominal: cleanAmount, user_id: userId }
     } else if (activeTab === 'anggaran') {
       table = 'budget_plans'
-      payload = { item_name: formInput.name, budget: cleanAmount, notes: formInput.notes, color: formInput.color }
+      payload = { item_name: formInput.name, budget: cleanAmount, notes: formInput.notes, color: formInput.color, user_id: userId }
     } else if (activeTab === 'tabungan') {
       table = 'savings'
-      payload = { goal_name: formInput.name, current_amount: cleanAmount, target_amount: cleanMaxAmount || cleanAmount, monthly_contribution: cleanMonthlyContribution || 500000 }
+      payload = { goal_name: formInput.name, current_amount: cleanAmount, target_amount: cleanMaxAmount || cleanAmount, monthly_contribution: cleanMonthlyContribution || 500000, user_id: userId }
     } else if (activeTab === 'aset') {
       table = 'physical_assets'
-      payload = { asset_name: formInput.name, market_value: cleanAmount, purchase_value: cleanBudgetAmount || cleanAmount, asset_category: formInput.status || 'Elektronik', notes: formInput.notes }
+      payload = { asset_name: formInput.name, market_value: cleanAmount, purchase_value: cleanBudgetAmount || cleanAmount, asset_category: formInput.status || 'Elektronik', notes: formInput.notes, user_id: userId }
     }
 
     const storageKey = 'sakupro_' + (
@@ -630,7 +698,9 @@ export default function App() {
 
     try {
       if (editingId) {
-        const { error } = await supabase.from(table).update(payload).eq('id', editingId)
+        // Hapus user_id dari payload update agar tidak mengubah pemilik
+        const { user_id, ...updatePayload } = payload
+        const { error } = await supabase.from(table).update(updatePayload).eq('id', editingId)
         if (error) throw error
       } else {
         const { error } = await supabase.from(table).insert([payload])
